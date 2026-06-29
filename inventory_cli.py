@@ -10,6 +10,8 @@ CLI-инструмент для инвентаризации серверов и
 """
 
 import argparse
+import gzip
+import io
 import json
 import sys
 from typing import Dict, Any, List, Optional
@@ -26,7 +28,6 @@ except ImportError as e:
     print("Установите зависимости: pip install httpx rich openpyxl")
     sys.exit(1)
 
-# Попытка импорта openpyxl для Excel
 try:
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment
@@ -45,14 +46,6 @@ class RedfishClient:
     """Клиент для работы с Redfish/Swordfish API"""
 
     def __init__(self, host: str, username: str, password: str, verify_ssl: bool = False, use_ssl: bool = True):
-        """
-        :param host: Адрес хоста (может включать протокол и порт, например localhost:8000 или https://192.168.1.1)
-        :param username: Имя пользователя
-        :param password: Пароль
-        :param verify_ssl: Проверять SSL-сертификат (только для HTTPS)
-        :param use_ssl: Использовать HTTPS (если True) или HTTP (если False)
-        """
-        # Если в host уже указан протокол, оставляем как есть, иначе добавляем на основе use_ssl
         if host.startswith(("http://", "https://")):
             self.base_url = host.rstrip('/')
         else:
@@ -61,53 +54,59 @@ class RedfishClient:
         self.username = username
         self.password = password
         self.verify_ssl = verify_ssl
-        self.session = httpx.Client(verify=verify_ssl, timeout=30.0)
+        self.session = httpx.Client(
+            verify=verify_ssl,
+            timeout=30.0,
+            trust_env=False,
+            follow_redirects=True
+        )
 
     def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
-        url = urljoin(self.base_url + '/', path.lstrip('/'))  # urljoin корректно объединит
+        url = urljoin(self.base_url + '/', path.lstrip('/'))
         response = self.session.request(
             method,
             url,
             auth=(self.username, self.password),
-            headers={"Accept": "application/json"},
+            headers={
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip, deflate"
+            },
             **kwargs
         )
         response.raise_for_status()
         return response
 
     def get(self, path: str) -> Dict[str, Any]:
-      response = self._request("GET", path)
-      content = response.content
-    
-    # Если это gzip
-    if content[:2] == b'\x1f\x8b':
-        import gzip
-        decompressed = gzip.decompress(content)
-        return json.loads(decompressed.decode('utf-8'))
-    else:
-        return response.json()
+        response = self._request("GET", path)
+        content = response.content
+
+        # Если ответ сжат gzip (сигнатура 1F 8B)
+        if len(content) >= 2 and content[:2] == b'\x1f\x8b':
+            try:
+                with gzip.GzipFile(fileobj=io.BytesIO(content)) as gz:
+                    decompressed = gz.read()
+                return json.loads(decompressed.decode('utf-8'))
+            except Exception:
+                # Если распаковка не удалась — пробуем как обычный JSON
+                return response.json()
+        else:
+            return response.json()
+
     def follow_collection(self, collection_path: str) -> List[Dict[str, Any]]:
-        """
-        Получает все элементы коллекции, следуя пагинации.
-        Redfish использует odata.nextLink для постраничной загрузки.
-        """
         items = []
         current_path = collection_path
         while current_path:
             data = self.get(current_path)
             members = data.get("Members", [])
             for member in members:
-                # member может быть ссылкой (dict с @odata.id) или объектом
                 if isinstance(member, dict) and "@odata.id" in member:
                     try:
                         member_data = self.get(member["@odata.id"])
                         items.append(member_data)
                     except Exception:
-                        # Если не удалось получить детали, добавляем только ссылку
                         items.append(member)
                 else:
                     items.append(member)
-            # Пагинация
             next_link = data.get("@odata.nextLink")
             current_path = next_link if next_link else None
         return items
@@ -118,7 +117,6 @@ class RedfishClient:
 # ============================================
 
 def collect_inventory(client: RedfishClient) -> Dict[str, List[Dict[str, Any]]]:
-    """Собирает все данные с устройства"""
     inventory = {
         "systems": [],
         "chassis": [],
@@ -134,12 +132,11 @@ def collect_inventory(client: RedfishClient) -> Dict[str, List[Dict[str, Any]]]:
         "backplanes": [],
     }
 
-    # 1. Системы (серверы)
+    # 1. Systems
     try:
         systems = client.follow_collection("/redfish/v1/Systems")
         for sys in systems:
             inventory["systems"].append(sys)
-            # Из системы можно извлечь CPU, память, сеть
             if "Processors" in sys and "@odata.id" in sys["Processors"]:
                 cpus = client.follow_collection(sys["Processors"]["@odata.id"])
                 for cpu in cpus:
@@ -155,16 +152,16 @@ def collect_inventory(client: RedfishClient) -> Dict[str, List[Dict[str, Any]]]:
     except Exception as e:
         console.print(f"[yellow]⚠️ Ошибка получения Systems: {e}[/]")
 
-    # 2. Шасси (питание, вентиляторы, диски)
+    # 2. Chassis
     try:
         chassis = client.follow_collection("/redfish/v1/Chassis")
         for ch in chassis:
             inventory["chassis"].append(ch)
-            # В шасси могут быть диски (Drives), блоки питания (PowerSupplies), вентиляторы (Fans)
             if "Drives" in ch and "@odata.id" in ch["Drives"]:
                 drives = client.follow_collection(ch["Drives"]["@odata.id"])
                 for disk in drives:
-                    inventory["disks"].append(disk)
+                    if disk.get("Name") or disk.get("SerialNumber") or disk.get("CapacityBytes", 0) > 0:
+                        inventory["disks"].append(disk)
             if "PowerSupplies" in ch and "@odata.id" in ch["PowerSupplies"]:
                 power = client.follow_collection(ch["PowerSupplies"]["@odata.id"])
                 for psu in power:
@@ -176,35 +173,28 @@ def collect_inventory(client: RedfishClient) -> Dict[str, List[Dict[str, Any]]]:
     except Exception as e:
         console.print(f"[yellow]⚠️ Ошибка получения Chassis: {e}[/]")
 
-    # 3. Хранилище (Storage) — диски, контроллеры, логические тома
+    # 3. Storage
     try:
-        storage_collection = client.get("/redfish/v1/Storage")
         storages = client.follow_collection("/redfish/v1/Storage")
         for st in storages:
             inventory["storage"].append(st)
-            # Диски внутри Storage
             if "Drives" in st and "@odata.id" in st["Drives"]:
                 drives = client.follow_collection(st["Drives"]["@odata.id"])
                 for disk in drives:
-                    inventory["disks"].append(disk)
-            # Контроллеры (StorageControllers)
+                    if disk.get("Name") or disk.get("SerialNumber") or disk.get("CapacityBytes", 0) > 0:
+                        inventory["disks"].append(disk)
             if "StorageControllers" in st:
                 controllers = st["StorageControllers"]
                 if isinstance(controllers, list):
                     inventory["controllers"].extend(controllers)
-                else:
-                    # может быть ссылка
-                    pass
-            # Backplanes? В некоторых реализациях есть отдельный ресурс
     except Exception as e:
         console.print(f"[yellow]⚠️ Ошибка получения Storage: {e}[/]")
 
-    # 4. Managers (для сетевых интерфейсов BMC)
+    # 4. Managers
     try:
         managers = client.follow_collection("/redfish/v1/Managers")
         for mgr in managers:
             inventory["managers"].append(mgr)
-            # NetworkInterfaces в менеджере (для BMC)
             if "NetworkInterfaces" in mgr and "@odata.id" in mgr["NetworkInterfaces"]:
                 net = client.follow_collection(mgr["NetworkInterfaces"]["@odata.id"])
                 for nic in net:
@@ -212,14 +202,12 @@ def collect_inventory(client: RedfishClient) -> Dict[str, List[Dict[str, Any]]]:
     except Exception as e:
         console.print(f"[yellow]⚠️ Ошибка получения Managers: {e}[/]")
 
-    # 5. Дополнительно: поиск дисков в SimpleStorage (устаревший, но может быть)
+    # 5. SimpleStorage (устаревшее)
     try:
-        # Некоторые системы используют SimpleStorage
         simple_storage = client.follow_collection("/redfish/v1/Systems/1/SimpleStorage")
         for ss in simple_storage:
             if "Devices" in ss:
                 for dev in ss["Devices"]:
-                    # преобразуем в диск
                     disk = {
                         "Name": dev.get("Name"),
                         "CapacityBytes": dev.get("SizeBytes"),
@@ -230,7 +218,8 @@ def collect_inventory(client: RedfishClient) -> Dict[str, List[Dict[str, Any]]]:
                         "Interface": dev.get("Interface"),
                         "Type": "SimpleStorage"
                     }
-                    inventory["disks"].append(disk)
+                    if disk.get("Name") or disk.get("SerialNumber") or disk.get("CapacityBytes", 0) > 0:
+                        inventory["disks"].append(disk)
     except Exception:
         pass
 
@@ -238,11 +227,10 @@ def collect_inventory(client: RedfishClient) -> Dict[str, List[Dict[str, Any]]]:
 
 
 # ============================================
-# ПАРСИНГ ДАННЫХ В УНИФИЦИРОВАННЫЙ ФОРМАТ
+# ПАРСИНГ
 # ============================================
 
 def parse_memory(mem: Dict) -> Dict:
-    """Парсит модуль памяти"""
     return {
         "Name": mem.get("Name", ""),
         "CapacityGB": mem.get("CapacityMB", 0) / 1024 if "CapacityMB" in mem else mem.get("CapacityGB", 0),
@@ -268,7 +256,6 @@ def parse_cpu(cpu: Dict) -> Dict:
     }
 
 def parse_disk(disk: Dict) -> Dict:
-    """Парсит диск (Drive)"""
     status = disk.get("Status", {})
     health = status.get("Health", "OK") if status else "OK"
     return {
@@ -349,11 +336,10 @@ def parse_system(sys: Dict) -> Dict:
 
 
 # ============================================
-# ВЫВОД В КОНСОЛЬ (Rich)
+# ВЫВОД
 # ============================================
 
 def print_table(title: str, columns: List[str], data: List[Dict], field_map: Dict[str, str]):
-    """Выводит таблицу с помощью Rich"""
     if not data:
         return
     table = Table(title=title)
@@ -364,7 +350,6 @@ def print_table(title: str, columns: List[str], data: List[Dict], field_map: Dic
         for col in columns:
             key = field_map.get(col, col)
             val = row.get(key, "")
-            # преобразуем в строку
             if isinstance(val, (int, float)):
                 if key in ["CapacityGB", "PowerWatts", "SpeedMbps", "SpeedRPM"] and val > 0:
                     row_values.append(f"{val:.2f}" if isinstance(val, float) else str(val))
@@ -379,8 +364,6 @@ def print_table(title: str, columns: List[str], data: List[Dict], field_map: Dic
 
 
 def print_inventory(inventory: Dict[str, List[Dict]], selected_types: List[str]):
-    """Выводит собранный инвентарь в виде таблиц"""
-    # Словари для отображения полей
     field_maps = {
         "disks": {
             "Name": "Name", "Model": "Model", "Serial": "Serial", "CapacityGB": "Capacity (GB)",
@@ -430,8 +413,6 @@ def print_inventory(inventory: Dict[str, List[Dict]], selected_types: List[str])
         "controllers": ["Name", "Model", "Manufacturer", "Firmware", "Status", "Serial", "PartNumber"],
         "systems": ["Name", "Model", "Manufacturer", "Serial", "Firmware", "Status", "PowerState"],
     }
-
-    # Парсим сырые данные в единый формат
     parsers = {
         "disks": parse_disk,
         "memory": parse_memory,
@@ -442,7 +423,6 @@ def print_inventory(inventory: Dict[str, List[Dict]], selected_types: List[str])
         "controllers": parse_controller,
         "systems": parse_system,
     }
-
     for key in selected_types:
         if key not in inventory:
             continue
@@ -459,9 +439,8 @@ def print_inventory(inventory: Dict[str, List[Dict]], selected_types: List[str])
         if columns:
             print_table(key.capitalize(), columns, parsed, field_map)
         else:
-            # fallback: вывести как JSON
             console.print(f"[bold]{key.capitalize()}:[/]")
-            for item in parsed[:5]:  # ограничим вывод
+            for item in parsed[:5]:
                 console.print(item)
             if len(parsed) > 5:
                 console.print(f"... и ещё {len(parsed)-5} записей")
@@ -472,13 +451,10 @@ def print_inventory(inventory: Dict[str, List[Dict]], selected_types: List[str])
 # ============================================
 
 def export_to_excel(inventory: Dict[str, List[Dict]], filename: str, selected_types: List[str]):
-    """Экспорт инвентаря в Excel (каждый тип компонентов на отдельном листе)"""
     if not HAS_OPENPYXL:
         console.print("[red]❌ openpyxl не установлен. Установите: pip install openpyxl[/]")
         return
-
     wb = openpyxl.Workbook()
-    # Удаляем стандартный лист
     wb.remove(wb.active)
     parsers = {
         "disks": parse_disk,
@@ -490,7 +466,6 @@ def export_to_excel(inventory: Dict[str, List[Dict]], filename: str, selected_ty
         "controllers": parse_controller,
         "systems": parse_system,
     }
-
     for key in selected_types:
         raw_data = inventory.get(key, [])
         if not raw_data:
@@ -502,21 +477,17 @@ def export_to_excel(inventory: Dict[str, List[Dict]], filename: str, selected_ty
             parsed = raw_data
         if not parsed:
             continue
-        # Создаём лист
-        ws = wb.create_sheet(title=key.capitalize()[:31])  # Excel ограничение на 31 символ
-        # Заголовки
+        ws = wb.create_sheet(title=key.capitalize()[:31])
         headers = list(parsed[0].keys())
         for col, header in enumerate(headers, 1):
             cell = ws.cell(row=1, column=col, value=header)
             cell.font = Font(bold=True, color="FFFFFF")
             cell.fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
             cell.alignment = Alignment(horizontal="center")
-        # Данные
         for row_idx, item in enumerate(parsed, 2):
             for col_idx, key_header in enumerate(headers, 1):
                 val = item.get(key_header)
                 ws.cell(row=row_idx, column=col_idx, value=val)
-        # Автоширина
         for col in ws.columns:
             max_len = 0
             col_letter = col[0].column_letter
@@ -524,13 +495,12 @@ def export_to_excel(inventory: Dict[str, List[Dict]], filename: str, selected_ty
                 if cell.value:
                     max_len = max(max_len, len(str(cell.value)))
             ws.column_dimensions[col_letter].width = min(max_len + 2, 30)
-
     wb.save(filename)
     console.print(f"[green]✅ Экспортировано в {filename}[/]")
 
 
 # ============================================
-# КОМАНДНАЯ СТРОКА (Argparse)
+# КОМАНДНАЯ СТРОКА
 # ============================================
 
 def parse_args():
@@ -538,29 +508,28 @@ def parse_args():
         description="Инвентаризация серверов и СХД через Redfish/Swordfish",
         epilog="Пример: python inventory_cli.py -H 192.168.1.100 -u admin -p pass --disks"
     )
-    parser.add_argument("-H", "--host", required=True, help="IP или FQDN устройства (можно с протоколом, например https://192.168.1.1 или http://localhost:8000)")
+    parser.add_argument("-H", "--host", required=True, help="IP или FQDN устройства")
     parser.add_argument("-u", "--username", required=True, help="Имя пользователя")
     parser.add_argument("-p", "--password", required=True, help="Пароль")
-    parser.add_argument("--verify-ssl", action="store_true", help="Включить проверку SSL сертификата (по умолчанию выключена)")
-    parser.add_argument("--no-ssl", action="store_true", help="Использовать HTTP вместо HTTPS (для мок-серверов). Игнорируется, если в host указан протокол.")
+    parser.add_argument("--verify-ssl", action="store_true", help="Включить проверку SSL сертификата")
+    parser.add_argument("--no-ssl", action="store_true", help="Использовать HTTP вместо HTTPS")
     parser.add_argument("--disks", action="store_true", help="Показать диски")
     parser.add_argument("--memory", action="store_true", help="Показать память")
     parser.add_argument("--cpu", action="store_true", help="Показать процессоры")
     parser.add_argument("--network", action="store_true", help="Показать сетевые интерфейсы")
     parser.add_argument("--power", action="store_true", help="Показать блоки питания")
     parser.add_argument("--fans", action="store_true", help="Показать вентиляторы")
-    parser.add_argument("--controllers", action="store_true", help="Показать контроллеры хранения")
+    parser.add_argument("--controllers", action="store_true", help="Показать контроллеры")
     parser.add_argument("--systems", action="store_true", help="Показать информацию о системах")
     parser.add_argument("--all", action="store_true", help="Показать все компоненты")
-    parser.add_argument("--excel", help="Сохранить отчёт в Excel файл (укажите имя файла)")
-    parser.add_argument("--json", action="store_true", help="Вывести сырой JSON (для отладки)")
+    parser.add_argument("--excel", help="Сохранить отчёт в Excel файл")
+    parser.add_argument("--json", action="store_true", help="Вывести сырой JSON")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    # Определяем, какие компоненты выводить
     if args.all:
         selected_types = ["disks", "memory", "cpu", "network", "power", "fans", "controllers", "systems"]
     else:
@@ -582,10 +551,8 @@ def main():
         if args.systems:
             selected_types.append("systems")
         if not selected_types:
-            # Если ничего не выбрано, показываем всё
             selected_types = ["disks", "memory", "cpu", "network", "power", "fans", "controllers", "systems"]
 
-    # Создаем клиент
     client = RedfishClient(
         args.host,
         args.username,
@@ -597,29 +564,25 @@ def main():
     console.print(f"[bold blue]🔍 Подключение к {args.host} (SSL: {'выкл' if args.no_ssl else 'вкл'})...[/]")
 
     try:
-        # Сбор инвентаря
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
             task = progress.add_task("Сбор данных...", total=None)
             inventory = collect_inventory(client)
             progress.update(task, completed=True)
 
-        # Если нужен JSON
         if args.json:
             console.print_json(data=inventory)
             return
 
-        # Вывод таблиц
         console.print()
         console.print(Panel.fit(f"[bold green]Инвентарь {args.host}[/]", border_style="green"))
         print_inventory(inventory, selected_types)
 
-        # Экспорт в Excel
         if args.excel:
             export_to_excel(inventory, args.excel, selected_types)
 
     except httpx.HTTPStatusError as e:
         console.print(f"[red]❌ HTTP ошибка: {e.response.status_code}[/]")
-        console.print(e.response.text)
+        console.print(e.response.text[:500] if e.response.text else "Нет тела ответа")
         sys.exit(1)
     except Exception as e:
         console.print(f"[red]❌ Ошибка: {e}[/]")
