@@ -77,16 +77,16 @@ class RedfishClient:
         return response
 
    def get(self, path: str) -> Dict[str, Any]:
-    response = self._request("GET", path)
-    content = response.content
+     response = self._request("GET", path)
+     content = response.content
 
-    # Проверяем сигнатуру gzip: 1F 8B
-    if len(content) >= 2 and content[0] == 0x1f and content[1] == 0x8b:
-        try:
-            import gzip
-            decompressed = gzip.decompress(content)
-            return json.loads(decompressed.decode('utf-8'))
-        except Exception as e:
+     # Проверяем сигнатуру gzip: 1F 8B
+     if len(content) >= 2 and content[0] == 0x1f and content[1] == 0x8b:
+       try:
+         import gzip
+         decompressed = gzip.decompress(content)
+         return json.loads(decompressed.decode('utf-8'))
+       except Exception as e:
             # Если распаковка не удалась, выводим ошибку и пробуем как есть
             console.print(f"[red]❌ Ошибка распаковки gzip: {e}[/]")
             # Пытаемся распарсить как обычный JSON (может упасть, но покажем ошибку)
