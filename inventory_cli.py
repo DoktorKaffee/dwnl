@@ -76,10 +76,16 @@ class RedfishClient:
         return response
 
     def get(self, path: str) -> Dict[str, Any]:
-        """Выполняет GET-запрос и возвращает JSON-словарь"""
-        response = self._request("GET", path)
+      response = self._request("GET", path)
+      content = response.content
+    
+    # Если это gzip
+    if content[:2] == b'\x1f\x8b':
+        import gzip
+        decompressed = gzip.decompress(content)
+        return json.loads(decompressed.decode('utf-8'))
+    else:
         return response.json()
-
     def follow_collection(self, collection_path: str) -> List[Dict[str, Any]]:
         """
         Получает все элементы коллекции, следуя пагинации.
